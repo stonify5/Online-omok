@@ -78,9 +78,8 @@ type SpectatorMessage struct {
 // Global variables
 var (
 	upgrader = websocket.Upgrader{
-		// CheckOrigin can be used to validate the origin of the WebSocket request
-		// For development, it's common to allow all origins:
-		// CheckOrigin: func(r *http.Request) bool { return true },
+		// Allow cross-origin requests for development and deployment
+		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 	rooms            []*OmokRoom
 	sockets          []*websocket.Conn // List of all active WebSocket connections (players + spectators)
@@ -779,8 +778,15 @@ func removeWebSocketFromSocketsUnsafe(wsToRemove *websocket.Conn) {
 	log.Printf("Socket %s removed. Current total sockets: %d", wsToRemove.RemoteAddr(), len(sockets))
 }
 
+// Health check handler
+func HealthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
 // Main function
 func main() {
+	http.HandleFunc("/health", HealthHandler)
 	http.HandleFunc("/game", SocketHandler)
 	http.HandleFunc("/spectator", SpectatorHandler)
 

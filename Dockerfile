@@ -21,6 +21,9 @@ RUN go build -o server .
 # Start a new stage from scratch for a smaller image
 FROM alpine:latest
 
+# Install curl for health checks
+RUN apk --no-cache add curl
+
 WORKDIR /root/
 
 # Copy the Pre-built binary file from the previous stage
