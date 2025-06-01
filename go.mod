@@ -1,5 +1,5 @@
-module github.com/in-jun/Online-omok
+module github.com/stonify5/backend
 
 go 1.19
 
-require github.com/gorilla/websocket v1.5.0
+require github.com/gorilla/websocket v1.5.3
