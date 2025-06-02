@@ -14,7 +14,7 @@ import (
 )
 
 // Constants
-const serverAddress = ":8080"
+const serverAddress = "0.0.0.0:8080"
 
 const (
 	BoardSize         = 15
@@ -90,12 +90,6 @@ var (
 
 // Handles matching users to rooms or creating new rooms.
 func RoomMatching(ws *websocket.Conn) {
-	globalMutex.Lock()
-	connectionsCount++
-	currentConnections := connectionsCount
-	globalMutex.Unlock()
-	BroadcastConnectionsCount(currentConnections) // Broadcast with the new count
-
 	log.Printf("Connection attempt from %s. Waiting for nickname.", ws.RemoteAddr())
 	_, nicknameBytes, err := ws.ReadMessage()
 	nickname := string(nicknameBytes)
@@ -135,6 +129,12 @@ func RoomMatching(ws *websocket.Conn) {
 				room.user2.nickname = nickname
 				log.Printf("User %s (%s) joined User %s (%s) in a room.", nickname, ws.RemoteAddr(), room.user1.nickname, room.user1.ws.RemoteAddr())
 
+				// Increment connection count for user2
+				connectionsCount++
+				currentConnections := connectionsCount
+				log.Printf("Connection count incremented for player %s (user2), current total: %d", nickname, currentConnections)
+				BroadcastConnectionsCountUnsafe(currentConnections)
+
 				// Unlock globalMutex before starting MessageHandler as it's a long-running blocking call
 				// and MessageHandler itself will manage room state.
 				go room.MessageHandler()
@@ -154,6 +154,12 @@ func RoomMatching(ws *websocket.Conn) {
 	rooms = append(rooms, newRoom)
 	log.Printf("User %s (%s) created a new room.", nickname, ws.RemoteAddr())
 	// User1 will wait in this room; MessageHandler is not started until user2 joins.
+
+	// Increment connection count only after successful room assignment
+	connectionsCount++
+	currentConnections := connectionsCount
+	log.Printf("Connection count incremented for player %s, current total: %d", nickname, currentConnections)
+	BroadcastConnectionsCountUnsafe(currentConnections)
 }
 
 // Main game loop for a room.
@@ -445,9 +451,11 @@ func (room *OmokRoom) prepareForReset() {
 func (room *OmokRoom) reset() {
 	log.Printf("Resetting room (User1: %s, User2: %s)...", room.user1.nickname, room.user2.nickname)
 
-	// Store WebSocket references before nullifying them
+	// Store WebSocket references and check flags before nullifying them
 	user1WS := room.user1.ws
 	user2WS := room.user2.ws
+	user1Active := room.user1.check
+	user2Active := room.user2.check
 
 	room.prepareForReset() // Close WebSockets and clear user checks
 
@@ -455,20 +463,45 @@ func (room *OmokRoom) reset() {
 	defer globalMutex.Unlock()
 
 	// Properly handle connection count decrements for players
-	// Note: prepareForReset already closed the WebSockets, but we need to manage the count
+	// Only decrement if the user was actually active and their WebSocket is in our list
 	connectionsDecremented := 0
 
-	if user1WS != nil {
-		removeWebSocketFromSocketsUnsafe(user1WS)
-		connectionsCount--
-		connectionsDecremented++
-		log.Printf("Decremented connection count for user1 %s", room.user1.nickname)
+	if user1Active && user1WS != nil {
+		// Check if this WebSocket is still in our global list before decrementing
+		wasInList := false
+		for _, socket := range sockets {
+			if socket == user1WS {
+				wasInList = true
+				break
+			}
+		}
+		if wasInList {
+			removeWebSocketFromSocketsUnsafe(user1WS)
+			connectionsCount--
+			connectionsDecremented++
+			log.Printf("Decremented connection count for user1 %s", room.user1.nickname)
+		} else {
+			log.Printf("User1 %s WebSocket already removed from global list", room.user1.nickname)
+		}
 	}
-	if user2WS != nil {
-		removeWebSocketFromSocketsUnsafe(user2WS)
-		connectionsCount--
-		connectionsDecremented++
-		log.Printf("Decremented connection count for user2 %s", room.user2.nickname)
+
+	if user2Active && user2WS != nil {
+		// Check if this WebSocket is still in our global list before decrementing
+		wasInList := false
+		for _, socket := range sockets {
+			if socket == user2WS {
+				wasInList = true
+				break
+			}
+		}
+		if wasInList {
+			removeWebSocketFromSocketsUnsafe(user2WS)
+			connectionsCount--
+			connectionsDecremented++
+			log.Printf("Decremented connection count for user2 %s", room.user2.nickname)
+		} else {
+			log.Printf("User2 %s WebSocket already removed from global list", room.user2.nickname)
+		}
 	}
 
 	removeRoomFromRoomsUnsafe(room)
@@ -476,12 +509,14 @@ func (room *OmokRoom) reset() {
 
 	if connectionsDecremented > 0 {
 		log.Printf("Room reset: decremented %d connections, current total: %d", connectionsDecremented, currentConnections)
+		BroadcastConnectionsCountUnsafe(currentConnections)
+	} else {
+		log.Printf("Room reset: no connections decremented (already cleaned up), current total: %d", currentConnections)
 	}
-
-	BroadcastConnectionsCountUnsafe(currentConnections)
 }
 
 // General handler for a failed/closed WebSocket connection.
+// This should only be called for spectators or in error cases, not for normal game room cleanup.
 func handleConnectionFailure(ws *websocket.Conn) {
 	if ws == nil {
 		return
@@ -505,10 +540,10 @@ func handleConnectionFailure(ws *websocket.Conn) {
 		removeWebSocketFromSocketsUnsafe(ws)
 		connectionsCount--
 		currentConnections := connectionsCount
-		log.Printf("Connection count decremented for %s, current total: %d", ws.RemoteAddr(), currentConnections)
+		log.Printf("Connection failure cleanup: decremented count for %s, current total: %d", ws.RemoteAddr(), currentConnections)
 		BroadcastConnectionsCountUnsafe(currentConnections)
 	} else {
-		log.Printf("WebSocket %s already removed from connections list", ws.RemoteAddr())
+		log.Printf("Connection failure: WebSocket %s already removed from connections list", ws.RemoteAddr())
 	}
 }
 
@@ -564,14 +599,14 @@ func upgradeWebSocketConnection(w http.ResponseWriter, r *http.Request) (*websoc
 
 // HTTP handler for game connections.
 func SocketHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Game connection request from %s", r.RemoteAddr)
 	ws, err := upgradeWebSocketConnection(w, r)
 	if err != nil {
+		log.Printf("Failed to upgrade game connection from %s: %v", r.RemoteAddr, err)
 		return // Error already logged by upgradeWebSocketConnection
 	}
 
-	// Always ensure cleanup happens when this handler exits
-	defer handleConnectionFailure(ws)
-
+	log.Printf("Starting room matching for %s", ws.RemoteAddr())
 	RoomMatching(ws)
 }
 
@@ -581,7 +616,6 @@ func SpectatorHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	defer handleConnectionFailure(ws) // Ensures cleanup when spectator goroutine exits or handler returns.
 
 	globalMutex.Lock()
 	connectionsCount++
@@ -595,15 +629,21 @@ func SpectatorHandler(w http.ResponseWriter, r *http.Request) {
 		var lastSentBoardState [TotalCells]uint8 // To avoid sending redundant board states
 		connectionCheckCounter := 0              // Only check connection periodically
 
+		// Move cleanup logic inside the goroutine to prevent race condition
+		defer func() {
+			log.Printf("Spectator %s goroutine cleaning up.", spectatorWs.RemoteAddr())
+			if assignedRoom != nil {
+				removeSocketFromSpectators(assignedRoom, spectatorWs)
+			}
+			handleConnectionFailure(spectatorWs)
+		}()
+
 		for {
 			// Only check connection every 10 iterations to reduce load
 			connectionCheckCounter++
 			if connectionCheckCounter%10 == 0 && !IsWebSocketConnected(spectatorWs) {
 				log.Printf("Spectator %s disconnected while waiting/watching.", spectatorWs.RemoteAddr())
-				if assignedRoom != nil {
-					removeSocketFromSpectators(assignedRoom, spectatorWs)
-				}
-				return // Exit goroutine, defer will call handleConnectionFailure
+				return // Exit goroutine, defer will handle cleanup
 			}
 
 			globalMutex.Lock()
@@ -631,8 +671,7 @@ func SpectatorHandler(w http.ResponseWriter, r *http.Request) {
 						}
 						if err := spectatorWs.WriteJSON(initialMsg); err != nil {
 							log.Printf("Error sending initial state to spectator %s: %v", spectatorWs.RemoteAddr(), err)
-							removeSocketFromSpectators(assignedRoom, spectatorWs) // Clean up from this room
-							return                                                // Exit goroutine
+							return // Exit goroutine, defer will handle cleanup
 						}
 					} else { // Still watching the same room, check if board updated
 						assignedRoom.spectatorsMux.Lock()
@@ -648,8 +687,7 @@ func SpectatorHandler(w http.ResponseWriter, r *http.Request) {
 							updateMsg := SpectatorMessage{Board: boardCopy}
 							if err := spectatorWs.WriteJSON(updateMsg); err != nil {
 								log.Printf("Error sending board update to spectator %s: %v", spectatorWs.RemoteAddr(), err)
-								removeSocketFromSpectators(assignedRoom, spectatorWs)
-								return
+								return // Exit goroutine, defer will handle cleanup
 							}
 						}
 					}
@@ -667,7 +705,7 @@ func SpectatorHandler(w http.ResponseWriter, r *http.Request) {
 				}
 				if err := spectatorWs.WriteJSON(Message{Message: "No active games to spectate. Waiting..."}); err != nil {
 					log.Printf("Error sending waiting message to spectator %s: %v", spectatorWs.RemoteAddr(), err)
-					return // Exit goroutine
+					return // Exit goroutine, defer will handle cleanup
 				}
 			}
 
@@ -689,43 +727,20 @@ func IsWebSocketConnected(conn *websocket.Conn) bool {
 		return false
 	}
 
-	// Set a longer deadline for the write operation to avoid premature timeouts
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	err := conn.WriteJSON(map[string]interface{}{"type": WebSocketPingType})
+	// First, try a simple write operation to test if the connection is still alive
+	// This is less intrusive than ping/pong and more reliable
+	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	err := conn.WriteJSON(map[string]interface{}{"type": "heartbeat"})
 	conn.SetWriteDeadline(time.Time{}) // Clear write deadline
 
 	if err != nil {
-		// Only log actual network errors, not normal timeouts
-		if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
-			log.Printf("IsWebSocketConnected: Failed to send Ping to %s: %v", conn.RemoteAddr(), err)
-		}
+		log.Printf("IsWebSocketConnected: Connection test failed for %s: %v", conn.RemoteAddr(), err)
 		return false
 	}
 
-	// Give more time for pong response to avoid false disconnections
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second)) // Expect pong within 10 seconds
-	msgType, pongMsg, err := conn.ReadMessage()
-	conn.SetReadDeadline(time.Time{}) // Clear read deadline
-
-	if err != nil {
-		// Don't log timeouts as errors since they're expected for disconnected clients
-		if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
-			log.Printf("IsWebSocketConnected: Failed to receive Pong from %s: %v", conn.RemoteAddr(), err)
-		}
-		return false
-	}
-
-	if msgType == websocket.TextMessage && string(pongMsg) == WebSocketPongType {
-		return true
-	}
-
-	// Accept any valid message as a sign of life, not just strict "pong" responses
-	// This makes the connection check more forgiving
-	if msgType == websocket.TextMessage {
-		return true
-	}
-
-	return false
+	// If write succeeds, assume connection is good
+	// Don't require a response as spectators may not send responses
+	return true
 }
 
 func addSocketToSpectators(room *OmokRoom, ws *websocket.Conn) {
@@ -790,25 +805,39 @@ func cleanupDisconnectedWaitingPlayers() {
 
 		// Check if room has only user1 waiting and they're disconnected
 		if room.user1.check && !room.user2.check {
-			// Check for nil WebSocket or closed connection
+			// Check for nil WebSocket first
 			if room.user1.ws == nil {
 				log.Printf("Removing room with nil WebSocket for waiting player: %s", room.user1.nickname)
 				keepRoom = false
 			} else {
-				// Check if connection is actually closed by attempting a quick ping
-				// Use a very short timeout to avoid blocking
-				room.user1.ws.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-				err := room.user1.ws.WriteJSON(map[string]interface{}{"type": "ping"})
-				room.user1.ws.SetWriteDeadline(time.Time{})
+				// Check if this WebSocket is still in our global list
+				stillInGlobalList := false
+				for _, socket := range sockets {
+					if socket == room.user1.ws {
+						stillInGlobalList = true
+						break
+					}
+				}
 
-				if err != nil {
-					log.Printf("Removing room with disconnected waiting player: %s (error: %v)", room.user1.nickname, err)
-					// Close the connection and clean up
+				if !stillInGlobalList {
+					log.Printf("Removing room with WebSocket not in global list for waiting player: %s", room.user1.nickname)
 					room.user1.ws.Close()
-					removeWebSocketFromSocketsUnsafe(room.user1.ws)
-					connectionsCount--
-					connectionsDecremented++
 					keepRoom = false
+				} else {
+					// Do a very lightweight connection test using ping control frame
+					room.user1.ws.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+					err := room.user1.ws.WriteMessage(websocket.PingMessage, []byte{})
+					room.user1.ws.SetWriteDeadline(time.Time{})
+
+					if err != nil {
+						log.Printf("Removing room with unresponsive waiting player: %s (error: %v)", room.user1.nickname, err)
+						// Close the connection and clean up
+						room.user1.ws.Close()
+						removeWebSocketFromSocketsUnsafe(room.user1.ws)
+						connectionsCount--
+						connectionsDecremented++
+						keepRoom = false
+					}
 				}
 			}
 		}
