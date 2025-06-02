@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"net"
 	"net/http"
@@ -97,44 +98,38 @@ func RoomMatching(ws *websocket.Conn) {
 
 	log.Printf("Connection attempt from %s. Waiting for nickname.", ws.RemoteAddr())
 	_, nicknameBytes, err := ws.ReadMessage()
-	if err != nil || utf8.RuneCountInString(string(nicknameBytes)) > MaxNicknameLength {
-		log.Printf("Error reading nickname or nickname too long from %s: %v", ws.RemoteAddr(), err)
+	nickname := string(nicknameBytes)
+	nicknameLength := utf8.RuneCountInString(nickname)
+	
+	if err != nil {
+		log.Printf("Error reading nickname from %s: %v", ws.RemoteAddr(), err)
 		handleConnectionFailure(ws)
 		return
 	}
-	nickname := string(nicknameBytes)
+	if nicknameLength == 0 {
+		log.Printf("Empty nickname received from %s", ws.RemoteAddr())
+		handleConnectionFailure(ws)
+		return
+	}
+	if nicknameLength > MaxNicknameLength {
+		log.Printf("Nickname too long from %s: %d characters (max %d)", ws.RemoteAddr(), nicknameLength, MaxNicknameLength)
+		handleConnectionFailure(ws)
+		return
+	}
+	
 	log.Printf("Nickname received from %s: %s", ws.RemoteAddr(), nickname)
 
 	globalMutex.Lock()
 	defer globalMutex.Unlock()
 
+	// Clean up disconnected waiting players before matching
+	cleanupDisconnectedWaitingPlayers()
+
 	for _, room := range rooms {
 		if room.user1.check && !room.user2.check { // Found a room with one player waiting
-			if !IsWebSocketConnected(room.user1.ws) { // Check if user1 is still connected
-				log.Printf("User1 in room (nickname: %s) disconnected. Resetting room.", room.user1.nickname)
-				room.prepareForReset() // Mark for reset, actual reset happens after unlock or carefully
-				// This room will be effectively reset or removed. Continue search or create new.
-				// For simplicity, let's let this room be cleaned up and create/find another.
-				// A more robust solution might involve a dedicated cleanup goroutine for stale rooms.
-				// For now, we'll proceed, and if this user1's room is reset, this new player won't join it.
-				// The reset logic needs to handle removing the room from the global 'rooms' slice.
-				// Let's assume room.reset() handles this.
-				// To avoid issues with modifying 'rooms' while iterating, mark for removal or rebuild list.
-				// The current room.reset() calls removeRoomFromRooms which rebuilds 'rooms'.
-				// This is problematic if called while iterating 'rooms'.
-				// A safer pattern: collect rooms to reset, then reset them outside the loop.
-				// Or, if room.reset() is called, it must be the last operation for that room in this function.
-				// Given the current structure, if user1.ws is dead, that room is unusable.
-				// We should probably close ws (the new connection) if we can't find a valid spot.
-				// Let's refine this: if user1 disconnected, that room is stale.
-				// We should clean it up.
-				// For now, if user1 is disconnected, we skip this room.
-				// The room will be reset when user1's handler eventually fails.
-				log.Printf("User1 in a waiting room (nickname: %s) seems disconnected. Skipping.", room.user1.nickname)
-				continue // Skip this stale room
-			}
-
-			if IsWebSocketConnected(ws) { // Check if the new player (user2) is still connected
+			// Quick check - if WebSocket is nil, skip this room and let cleanup handle it
+			if room.user1.ws != nil {
+				// Just assign user2 to this room - don't ping during matching
 				room.user2.check = true
 				room.user2.ws = ws
 				room.user2.nickname = nickname
@@ -142,30 +137,12 @@ func RoomMatching(ws *websocket.Conn) {
 
 				// Unlock globalMutex before starting MessageHandler as it's a long-running blocking call
 				// and MessageHandler itself will manage room state.
-				// However, MessageHandler might call room.reset() which modifies global 'rooms'.
-				// This needs careful thought. If MessageHandler is run in a new goroutine,
-				// the lock management changes.
-				// For now, assuming MessageHandler is blocking and handles its own lifecycle.
-				// The issue is that room.reset() modifies global 'rooms'.
-				// Let's run MessageHandler in a goroutine.
 				go room.MessageHandler()
 				return // Successfully matched
+			} else {
+				// Waiting player WebSocket is nil, this room will be cleaned up
+				log.Printf("Skipping room with nil WebSocket for waiting player: %s", room.user1.nickname)
 			}
-			// New player disconnected before matching completed
-			log.Printf("New player %s (%s) disconnected before matching could complete.", nickname, ws.RemoteAddr())
-			// No need to call handleConnectionFailure for ws, as it's already disconnected.
-			// The IsWebSocketConnected check would have confirmed this.
-			// We just return, global connectionsCount was already incremented and will be decremented if ws's handler fails.
-			// Or, more accurately, if ws is now considered "failed to match", decrement count.
-			// connectionsCount was incremented at the start. If ws fails here, it should be decremented.
-			// This path means ws is dead.
-			// We need a way to decrement connectionsCount for 'ws' if it dies here.
-			// The IsWebSocketConnected(ws) implies it's dead.
-			// Let's ensure handleConnectionFailure is robust.
-			// The original handleFailedRoomMatching(ws) was for this.
-			// It's better to call a generic cleanup for 'ws'.
-			handleConnectionFailure(ws) // This will close and decrement count for ws.
-			return
 		}
 	}
 
@@ -182,6 +159,7 @@ func RoomMatching(ws *websocket.Conn) {
 // Main game loop for a room.
 func (room *OmokRoom) MessageHandler() {
 	log.Printf("Game starting between %s (black) and %s (white).", room.user1.nickname, room.user2.nickname)
+	
 	// Notify players of game start and their colors/opponent's nickname
 	err1 := room.user1.ws.WriteJSON(Message{YourColor: "black", Nickname: room.user2.nickname})
 	err2 := room.user2.ws.WriteJSON(Message{YourColor: "white", Nickname: room.user1.nickname})
@@ -203,10 +181,10 @@ func (room *OmokRoom) MessageHandler() {
 			log.Printf("User %s (black) timed out. %s (white) wins.", room.user1.nickname, room.user2.nickname)
 			if room.user2.ws != nil {
 				room.user2.ws.WriteJSON(Message{Message: StatusUser1Timeout})
-			} // Opponent (user1) timed out
+			}
 			if room.user1.ws != nil {
 				room.user1.ws.WriteJSON(Message{Message: StatusLoss})
-			} // You (user1) timed out -> loss
+			}
 			room.reset()
 			return
 		}
@@ -241,8 +219,6 @@ func (room *OmokRoom) MessageHandler() {
 			}
 		} else {
 			log.Printf("Invalid move from %s (black). Game reset.", room.user1.nickname)
-			// Notify user1 of invalid move? Or just reset.
-			// For simplicity, reset. A more advanced server might send an error and allow retry.
 			room.reset()
 			return
 		}
@@ -253,10 +229,10 @@ func (room *OmokRoom) MessageHandler() {
 			log.Printf("User %s (white) timed out. %s (black) wins.", room.user2.nickname, room.user1.nickname)
 			if room.user1.ws != nil {
 				room.user1.ws.WriteJSON(Message{Message: StatusUser2Timeout})
-			} // Opponent (user2) timed out
+			}
 			if room.user2.ws != nil {
 				room.user2.ws.WriteJSON(Message{Message: StatusLoss})
-			} // You (user2) timed out -> loss
+			}
 			room.reset()
 			return
 		}
@@ -396,24 +372,46 @@ func reading(ws *websocket.Conn) (int, bool, bool) {
 	if ws == nil {
 		return 0, false, true // Error if ws is nil
 	}
-	ws.SetReadDeadline(time.Now().Add(TimeoutDuration))
-	_, msgBytes, err := ws.ReadMessage()
-	ws.SetReadDeadline(time.Time{}) // Clear the deadline
+	
+	for {
+		ws.SetReadDeadline(time.Now().Add(TimeoutDuration))
+		_, msgBytes, err := ws.ReadMessage()
+		ws.SetReadDeadline(time.Time{}) // Clear the deadline
 
-	if err != nil {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return 0, true, false // Timeout
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return 0, true, false // Timeout
+			}
+			log.Printf("Error reading from WebSocket %s: %v", ws.RemoteAddr(), err)
+			return 0, false, true // Other error
 		}
-		log.Printf("Error reading from WebSocket %s: %v", ws.RemoteAddr(), err)
-		return 0, false, true // Other error
-	}
 
-	moveIndex, convErr := strconv.Atoi(string(msgBytes))
-	if convErr != nil {
-		log.Printf("Error converting message to int from %s ('%s'): %v", ws.RemoteAddr(), string(msgBytes), convErr)
-		return 0, false, true // Conversion error
+		msgStr := string(msgBytes)
+		
+		// Handle ping/pong messages - don't treat them as game moves
+		if msgStr == WebSocketPongType {
+			// Client responded to our ping, continue reading for actual game move
+			continue
+		}
+		
+		// Check if this is a JSON ping message
+		var jsonMsg map[string]interface{}
+		if json.Unmarshal(msgBytes, &jsonMsg) == nil {
+			if msgType, exists := jsonMsg["type"]; exists && msgType == WebSocketPingType {
+				// Send pong response
+				ws.WriteJSON(map[string]interface{}{"type": WebSocketPongType})
+				continue
+			}
+		}
+
+		// Try to parse as game move
+		moveIndex, convErr := strconv.Atoi(msgStr)
+		if convErr != nil {
+			log.Printf("Error converting message to int from %s ('%s'): %v", ws.RemoteAddr(), msgStr, convErr)
+			return 0, false, true // Conversion error
+		}
+		return moveIndex, false, false
 	}
-	return moveIndex, false, false
 }
 
 // Prepares a room for reset by nullifying its user WebSockets.
@@ -556,40 +554,9 @@ func SocketHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return // Error already logged by upgradeWebSocketConnection
 	}
-	// defer handleConnectionFailure(ws) // This defer will run when SocketHandler returns.
-	// RoomMatching is blocking or spawns its own goroutine (MessageHandler).
-	// If RoomMatching is blocking and ws is passed, then when RoomMatching returns,
-	// this defer is appropriate.
-	// If MessageHandler is a goroutine, ws might live on.
-	// Let's make RoomMatching responsible for the lifecycle of ws if it takes it over.
-	// Or, handleConnectionFailure should be robustly called when ws is truly done.
 
-	// For a player, RoomMatching will handle its lifecycle.
-	// If RoomMatching fails to match or the game ends, the connection should be cleaned up.
-	// The current RoomMatching calls handleConnectionFailure on early exit.
-	// If a game starts (MessageHandler), that goroutine is responsible for the player WebSockets.
-	// The 'defer handleConnectionFailure(ws)' here would be for the case where upgradeWebSocketConnection succeeds
-	// but RoomMatching itself panics or returns without assigning ws to a room or handling its closure.
-	// This is a safety net.
-	defer func() {
-		// Check if ws is still in global sockets list. If so, it means it wasn't properly cleaned up.
-		// This is a fallback. Proper cleanup should happen in game logic / room reset.
-		globalMutex.Lock()
-		stillExists := false
-		for _, s := range sockets {
-			if s == ws {
-				stillExists = true
-				break
-			}
-		}
-		globalMutex.Unlock()
-
-		if stillExists {
-			log.Printf("Fallback cleanup for player WebSocket %s in SocketHandler defer", ws.RemoteAddr())
-			handleConnectionFailure(ws)
-		}
-	}()
-
+	// Don't use a defer cleanup here since RoomMatching will handle the WebSocket lifecycle
+	// The MessageHandler will manage the connection for the duration of the game
 	RoomMatching(ws)
 }
 
@@ -611,9 +578,12 @@ func SpectatorHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Spectator %s connected. Finding a room.", spectatorWs.RemoteAddr())
 		var assignedRoom *OmokRoom
 		var lastSentBoardState [TotalCells]uint8 // To avoid sending redundant board states
+		connectionCheckCounter := 0               // Only check connection periodically
 
 		for {
-			if !IsWebSocketConnected(spectatorWs) { // Check if spectator is still connected
+			// Only check connection every 10 iterations to reduce load
+			connectionCheckCounter++
+			if connectionCheckCounter%10 == 0 && !IsWebSocketConnected(spectatorWs) {
 				log.Printf("Spectator %s disconnected while waiting/watching.", spectatorWs.RemoteAddr())
 				if assignedRoom != nil {
 					removeSocketFromSpectators(assignedRoom, spectatorWs)
@@ -703,33 +673,44 @@ func IsWebSocketConnected(conn *websocket.Conn) bool {
 	if conn == nil {
 		return false
 	}
-	// Set a short deadline for the write operation itself.
-	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	
+	// Set a longer deadline for the write operation to avoid premature timeouts
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	err := conn.WriteJSON(map[string]interface{}{"type": WebSocketPingType})
 	conn.SetWriteDeadline(time.Time{}) // Clear write deadline
 
 	if err != nil {
-		log.Printf("IsWebSocketConnected: Failed to send Ping to %s: %v", conn.RemoteAddr(), err)
+		// Only log actual network errors, not normal timeouts
+		if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+			log.Printf("IsWebSocketConnected: Failed to send Ping to %s: %v", conn.RemoteAddr(), err)
+		}
 		return false
 	}
 
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second)) // Expect pong within 3 seconds
+	// Give more time for pong response to avoid false disconnections
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second)) // Expect pong within 10 seconds
 	msgType, pongMsg, err := conn.ReadMessage()
 	conn.SetReadDeadline(time.Time{}) // Clear read deadline
 
 	if err != nil {
-		// Don't log "normal" timeouts if that's how we detect closure via ping.
-		// if e, ok := err.(net.Error); !ok || !e.Timeout() {
-		// log.Printf("IsWebSocketConnected: Failed to receive Pong from %s: %v", conn.RemoteAddr(), err)
-		// }
+		// Don't log timeouts as errors since they're expected for disconnected clients
+		if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+			log.Printf("IsWebSocketConnected: Failed to receive Pong from %s: %v", conn.RemoteAddr(), err)
+		}
 		return false
 	}
 
 	if msgType == websocket.TextMessage && string(pongMsg) == WebSocketPongType {
 		return true
 	}
-	// log.Printf("IsWebSocketConnected: Received unexpected Pong from %s (type %d, content '%s')", conn.RemoteAddr(), msgType, string(pongMsg))
-	return false // Or true if any message is considered a sign of life after ping. Strict check for now.
+	
+	// Accept any valid message as a sign of life, not just strict "pong" responses
+	// This makes the connection check more forgiving
+	if msgType == websocket.TextMessage {
+		return true
+	}
+	
+	return false
 }
 
 func addSocketToSpectators(room *OmokRoom, ws *websocket.Conn) {
@@ -782,6 +763,28 @@ func removeWebSocketFromSocketsUnsafe(wsToRemove *websocket.Conn) {
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
+}
+
+// Removes rooms with disconnected waiting players. Assumes globalMutex is held by caller.
+func cleanupDisconnectedWaitingPlayers() {
+	newRooms := []*OmokRoom{}
+	for _, room := range rooms {
+		keepRoom := true
+		
+		// Check if room has only user1 waiting and they're disconnected
+		if room.user1.check && !room.user2.check {
+			// Only check for nil WebSocket, don't ping during cleanup to avoid hangs
+			if room.user1.ws == nil {
+				log.Printf("Removing room with nil WebSocket for waiting player: %s", room.user1.nickname)
+				keepRoom = false
+			}
+		}
+		
+		if keepRoom {
+			newRooms = append(newRooms, room)
+		}
+	}
+	rooms = newRooms
 }
 
 // Main function
