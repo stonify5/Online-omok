@@ -445,39 +445,39 @@ func (room *OmokRoom) prepareForReset() {
 func (room *OmokRoom) reset() {
 	log.Printf("Resetting room (User1: %s, User2: %s)...", room.user1.nickname, room.user2.nickname)
 
+	// Store WebSocket references before nullifying them
+	user1WS := room.user1.ws
+	user2WS := room.user2.ws
+
 	room.prepareForReset() // Close WebSockets and clear user checks
 
 	globalMutex.Lock()
 	defer globalMutex.Unlock()
 
-	// Remove user WebSockets from global 'sockets' list and decrement count
-	// This is tricky because handleConnectionFailure also does this.
-	// A connection should only be removed and counted once.
-	// Let's assume that if a room is reset, its player connections are "terminated" here.
-	if room.user1.ws != nil { // This check is now redundant due to prepareForReset, but safe
-		// removeWebSocketFromSockets(room.user1.ws) // Done by handleConnectionFailure if called from ws handler
-		// connectionsCount-- // This logic needs to be robust against double counting
-	}
-	if room.user2.ws != nil {
-		// removeWebSocketFromSockets(room.user2.ws)
-		// connectionsCount--
-	}
-	// The connectionsCount for players is tricky. It's incremented when they first connect.
-	// It should be decremented when their connection truly ends.
-	// If room.reset() is called, it means the game ended. Their individual socket handlers
-	// (SocketHandler -> RoomMatching -> which then might lead to MessageHandler)
-	// will eventually terminate. The defer in those handlers (if any) or explicit calls
-	// to handleConnectionFailure should manage the count.
-	// For now, room.reset() focuses on cleaning the room's state and player slots.
-	// The global 'connectionsCount' is managed by handleConnectionFailure.
+	// Properly handle connection count decrements for players
+	// Note: prepareForReset already closed the WebSockets, but we need to manage the count
+	connectionsDecremented := 0
 
-	removeRoomFromRoomsUnsafe(room)        // Unsafe because it modifies 'rooms' without its own lock here (caller holds globalMutex)
-	currentConnections := connectionsCount // Get current count under lock
+	if user1WS != nil {
+		removeWebSocketFromSocketsUnsafe(user1WS)
+		connectionsCount--
+		connectionsDecremented++
+		log.Printf("Decremented connection count for user1 %s", room.user1.nickname)
+	}
+	if user2WS != nil {
+		removeWebSocketFromSocketsUnsafe(user2WS)
+		connectionsCount--
+		connectionsDecremented++
+		log.Printf("Decremented connection count for user2 %s", room.user2.nickname)
+	}
 
-	// No, BroadcastConnectionsCount should not be called with globalMutex held if it tries to acquire it.
-	// Let's read count, unlock, then broadcast.
-	// However, BroadcastConnectionsCount iterates 'sockets' which also needs globalMutex.
-	// So, it's fine to call it while holding globalMutex.
+	removeRoomFromRoomsUnsafe(room)
+	currentConnections := connectionsCount
+
+	if connectionsDecremented > 0 {
+		log.Printf("Room reset: decremented %d connections, current total: %d", connectionsDecremented, currentConnections)
+	}
+
 	BroadcastConnectionsCountUnsafe(currentConnections)
 }
 
@@ -492,10 +492,24 @@ func handleConnectionFailure(ws *websocket.Conn) {
 	globalMutex.Lock()
 	defer globalMutex.Unlock()
 
-	removeWebSocketFromSocketsUnsafe(ws)
-	connectionsCount--
-	currentConnections := connectionsCount
-	BroadcastConnectionsCountUnsafe(currentConnections)
+	// Check if WebSocket is still in the sockets list before removing and decrementing
+	wasInList := false
+	for _, socket := range sockets {
+		if socket == ws {
+			wasInList = true
+			break
+		}
+	}
+
+	if wasInList {
+		removeWebSocketFromSocketsUnsafe(ws)
+		connectionsCount--
+		currentConnections := connectionsCount
+		log.Printf("Connection count decremented for %s, current total: %d", ws.RemoteAddr(), currentConnections)
+		BroadcastConnectionsCountUnsafe(currentConnections)
+	} else {
+		log.Printf("WebSocket %s already removed from connections list", ws.RemoteAddr())
+	}
 }
 
 // Removes a room from the global 'rooms' list. Assumes globalMutex is held by caller.
@@ -555,8 +569,9 @@ func SocketHandler(w http.ResponseWriter, r *http.Request) {
 		return // Error already logged by upgradeWebSocketConnection
 	}
 
-	// Don't use a defer cleanup here since RoomMatching will handle the WebSocket lifecycle
-	// The MessageHandler will manage the connection for the duration of the game
+	// Always ensure cleanup happens when this handler exits
+	defer handleConnectionFailure(ws)
+
 	RoomMatching(ws)
 }
 
@@ -768,15 +783,33 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 // Removes rooms with disconnected waiting players. Assumes globalMutex is held by caller.
 func cleanupDisconnectedWaitingPlayers() {
 	newRooms := []*OmokRoom{}
+	connectionsDecremented := 0
+
 	for _, room := range rooms {
 		keepRoom := true
 
 		// Check if room has only user1 waiting and they're disconnected
 		if room.user1.check && !room.user2.check {
-			// Only check for nil WebSocket, don't ping during cleanup to avoid hangs
+			// Check for nil WebSocket or closed connection
 			if room.user1.ws == nil {
 				log.Printf("Removing room with nil WebSocket for waiting player: %s", room.user1.nickname)
 				keepRoom = false
+			} else {
+				// Check if connection is actually closed by attempting a quick ping
+				// Use a very short timeout to avoid blocking
+				room.user1.ws.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+				err := room.user1.ws.WriteJSON(map[string]interface{}{"type": "ping"})
+				room.user1.ws.SetWriteDeadline(time.Time{})
+
+				if err != nil {
+					log.Printf("Removing room with disconnected waiting player: %s (error: %v)", room.user1.nickname, err)
+					// Close the connection and clean up
+					room.user1.ws.Close()
+					removeWebSocketFromSocketsUnsafe(room.user1.ws)
+					connectionsCount--
+					connectionsDecremented++
+					keepRoom = false
+				}
 			}
 		}
 
@@ -784,11 +817,43 @@ func cleanupDisconnectedWaitingPlayers() {
 			newRooms = append(newRooms, room)
 		}
 	}
+
 	rooms = newRooms
+
+	if connectionsDecremented > 0 {
+		log.Printf("Cleanup: removed %d disconnected waiting players, current connections: %d", connectionsDecremented, connectionsCount)
+		BroadcastConnectionsCountUnsafe(connectionsCount)
+	}
+}
+
+// Background cleanup for disconnected waiting players
+func backgroundCleanup() {
+	ticker := time.NewTicker(30 * time.Second) // Check every 30 seconds
+	defer ticker.Stop()
+
+	for range ticker.C {
+		globalMutex.Lock()
+		initialRoomCount := len(rooms)
+		initialConnectionCount := connectionsCount
+
+		cleanupDisconnectedWaitingPlayers()
+
+		finalRoomCount := len(rooms)
+		finalConnectionCount := connectionsCount
+
+		if initialRoomCount != finalRoomCount || initialConnectionCount != finalConnectionCount {
+			log.Printf("Background cleanup: rooms %d->%d, connections %d->%d",
+				initialRoomCount, finalRoomCount, initialConnectionCount, finalConnectionCount)
+		}
+		globalMutex.Unlock()
+	}
 }
 
 // Main function
 func main() {
+	// Start background cleanup for disconnected waiting players
+	go backgroundCleanup()
+
 	http.HandleFunc("/health", HealthHandler)
 	http.HandleFunc("/game", SocketHandler)
 	http.HandleFunc("/spectator", SpectatorHandler)
