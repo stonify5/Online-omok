@@ -100,7 +100,7 @@ func RoomMatching(ws *websocket.Conn) {
 	_, nicknameBytes, err := ws.ReadMessage()
 	nickname := string(nicknameBytes)
 	nicknameLength := utf8.RuneCountInString(nickname)
-	
+
 	if err != nil {
 		log.Printf("Error reading nickname from %s: %v", ws.RemoteAddr(), err)
 		handleConnectionFailure(ws)
@@ -116,7 +116,7 @@ func RoomMatching(ws *websocket.Conn) {
 		handleConnectionFailure(ws)
 		return
 	}
-	
+
 	log.Printf("Nickname received from %s: %s", ws.RemoteAddr(), nickname)
 
 	globalMutex.Lock()
@@ -159,7 +159,7 @@ func RoomMatching(ws *websocket.Conn) {
 // Main game loop for a room.
 func (room *OmokRoom) MessageHandler() {
 	log.Printf("Game starting between %s (black) and %s (white).", room.user1.nickname, room.user2.nickname)
-	
+
 	// Notify players of game start and their colors/opponent's nickname
 	err1 := room.user1.ws.WriteJSON(Message{YourColor: "black", Nickname: room.user2.nickname})
 	err2 := room.user2.ws.WriteJSON(Message{YourColor: "white", Nickname: room.user1.nickname})
@@ -372,7 +372,7 @@ func reading(ws *websocket.Conn) (int, bool, bool) {
 	if ws == nil {
 		return 0, false, true // Error if ws is nil
 	}
-	
+
 	for {
 		ws.SetReadDeadline(time.Now().Add(TimeoutDuration))
 		_, msgBytes, err := ws.ReadMessage()
@@ -387,13 +387,13 @@ func reading(ws *websocket.Conn) (int, bool, bool) {
 		}
 
 		msgStr := string(msgBytes)
-		
+
 		// Handle ping/pong messages - don't treat them as game moves
 		if msgStr == WebSocketPongType {
 			// Client responded to our ping, continue reading for actual game move
 			continue
 		}
-		
+
 		// Check if this is a JSON ping message
 		var jsonMsg map[string]interface{}
 		if json.Unmarshal(msgBytes, &jsonMsg) == nil {
@@ -578,7 +578,7 @@ func SpectatorHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Spectator %s connected. Finding a room.", spectatorWs.RemoteAddr())
 		var assignedRoom *OmokRoom
 		var lastSentBoardState [TotalCells]uint8 // To avoid sending redundant board states
-		connectionCheckCounter := 0               // Only check connection periodically
+		connectionCheckCounter := 0              // Only check connection periodically
 
 		for {
 			// Only check connection every 10 iterations to reduce load
@@ -673,7 +673,7 @@ func IsWebSocketConnected(conn *websocket.Conn) bool {
 	if conn == nil {
 		return false
 	}
-	
+
 	// Set a longer deadline for the write operation to avoid premature timeouts
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	err := conn.WriteJSON(map[string]interface{}{"type": WebSocketPingType})
@@ -703,13 +703,13 @@ func IsWebSocketConnected(conn *websocket.Conn) bool {
 	if msgType == websocket.TextMessage && string(pongMsg) == WebSocketPongType {
 		return true
 	}
-	
+
 	// Accept any valid message as a sign of life, not just strict "pong" responses
 	// This makes the connection check more forgiving
 	if msgType == websocket.TextMessage {
 		return true
 	}
-	
+
 	return false
 }
 
@@ -770,7 +770,7 @@ func cleanupDisconnectedWaitingPlayers() {
 	newRooms := []*OmokRoom{}
 	for _, room := range rooms {
 		keepRoom := true
-		
+
 		// Check if room has only user1 waiting and they're disconnected
 		if room.user1.check && !room.user2.check {
 			// Only check for nil WebSocket, don't ping during cleanup to avoid hangs
@@ -779,7 +779,7 @@ func cleanupDisconnectedWaitingPlayers() {
 				keepRoom = false
 			}
 		}
-		
+
 		if keepRoom {
 			newRooms = append(newRooms, room)
 		}
