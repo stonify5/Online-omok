@@ -121,9 +121,9 @@ func RoomMatching(ws *websocket.Conn) {
 
 	for _, room := range rooms {
 		if room.user1.check && !room.user2.check { // Found a room with one player waiting
-			// Quick check - if WebSocket is nil, skip this room and let cleanup handle it
-			if room.user1.ws != nil {
-				// Just assign user2 to this room - don't ping during matching
+			// Check WebSocket connection state
+			if room.user1.ws != nil && IsWebSocketConnectedSync(room.user1.ws) {
+				// Assign user2 to this room
 				room.user2.check = true
 				room.user2.ws = ws
 				room.user2.nickname = nickname
@@ -135,13 +135,17 @@ func RoomMatching(ws *websocket.Conn) {
 				log.Printf("Connection count incremented for player %s (user2), current total: %d", nickname, currentConnections)
 				BroadcastConnectionsCountUnsafe(currentConnections)
 
-				// Unlock globalMutex before starting MessageHandler as it's a long-running blocking call
-				// and MessageHandler itself will manage room state.
+				// Start game
 				go room.MessageHandler()
 				return // Successfully matched
 			} else {
-				// Waiting player WebSocket is nil, this room will be cleaned up
-				log.Printf("Skipping room with nil WebSocket for waiting player: %s", room.user1.nickname)
+				// Waiting player is disconnected, clean up the room
+				log.Printf("Removing room with disconnected waiting player: %s", room.user1.nickname)
+				if room.user1.ws != nil {
+					removeWebSocketFromSocketsUnsafe(room.user1.ws)
+					room.user1.ws.Close()
+				}
+				// Room will be cleaned up by cleanupDisconnectedWaitingPlayers
 			}
 		}
 	}
@@ -522,29 +526,30 @@ func handleConnectionFailure(ws *websocket.Conn) {
 		return
 	}
 	log.Printf("Handling connection failure/closure for %s", ws.RemoteAddr())
-	ws.Close()
 
 	globalMutex.Lock()
 	defer globalMutex.Unlock()
 
-	// Check if WebSocket is still in the sockets list before removing and decrementing
+	// Remove from sockets list
 	wasInList := false
+	newSockets := []*websocket.Conn{}
 	for _, socket := range sockets {
 		if socket == ws {
 			wasInList = true
-			break
+		} else {
+			newSockets = append(newSockets, socket)
 		}
 	}
 
 	if wasInList {
-		removeWebSocketFromSocketsUnsafe(ws)
+		sockets = newSockets
 		connectionsCount--
-		currentConnections := connectionsCount
-		log.Printf("Connection failure cleanup: decremented count for %s, current total: %d", ws.RemoteAddr(), currentConnections)
-		BroadcastConnectionsCountUnsafe(currentConnections)
-	} else {
-		log.Printf("Connection failure: WebSocket %s already removed from connections list", ws.RemoteAddr())
+		log.Printf("Socket %s removed. Current total sockets: %d, connections: %d",
+			ws.RemoteAddr(), len(sockets), connectionsCount)
+		BroadcastConnectionsCountUnsafe(connectionsCount)
 	}
+
+	ws.Close()
 }
 
 // Removes a room from the global 'rooms' list. Assumes globalMutex is held by caller.
@@ -561,17 +566,29 @@ func removeRoomFromRoomsUnsafe(roomToRemove *OmokRoom) {
 
 // Broadcasts the current number of connections to all sockets. Assumes globalMutex is held by caller.
 func BroadcastConnectionsCountUnsafe(count int) {
-	log.Printf("Broadcasting connection count: %d to %d sockets", count, len(sockets))
+	validSockets := []*websocket.Conn{}
 	message := Message{NumUsers: count}
+
 	for _, s := range sockets {
 		if s != nil {
-			if err := s.WriteJSON(message); err != nil {
-				// Log error, but don't let one bad socket stop broadcast to others.
-				// Bad sockets will be cleaned up by their own handlers.
-				log.Printf("Error broadcasting connection count to %s: %v", s.RemoteAddr(), err)
+			err := s.WriteJSON(message)
+			if err != nil {
+				log.Printf("Error broadcasting to %s: %v. Will be removed.", s.RemoteAddr(), err)
+				s.Close()
+			} else {
+				validSockets = append(validSockets, s)
 			}
 		}
 	}
+
+	// Keep only valid sockets
+	if len(validSockets) != len(sockets) {
+		sockets = validSockets
+		connectionsCount = len(sockets)
+		log.Printf("Cleaned up invalid sockets. New count: %d", connectionsCount)
+	}
+
+	log.Printf("Broadcasting connection count: %d to %d sockets", count, len(sockets))
 }
 
 // Wrapper for broadcasting connection count that handles locking.
@@ -592,6 +609,7 @@ func upgradeWebSocketConnection(w http.ResponseWriter, r *http.Request) (*websoc
 
 	globalMutex.Lock()
 	sockets = append(sockets, ws)
+	log.Printf("Added to sockets list. Total sockets: %d", len(sockets))
 	globalMutex.Unlock()
 	// Note: connectionsCount is incremented by player/spectator specific logic, not here.
 	return ws, nil
@@ -743,6 +761,20 @@ func IsWebSocketConnected(conn *websocket.Conn) bool {
 	return true
 }
 
+// Synchronous WebSocket connection check for immediate verification
+func IsWebSocketConnectedSync(conn *websocket.Conn) bool {
+	if conn == nil {
+		return false
+	}
+
+	// Short timeout ping test
+	conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+	err := conn.WriteMessage(websocket.PingMessage, []byte{})
+	conn.SetWriteDeadline(time.Time{})
+
+	return err == nil
+}
+
 func addSocketToSpectators(room *OmokRoom, ws *websocket.Conn) {
 	if room == nil || ws == nil {
 		return
@@ -805,7 +837,6 @@ func cleanupDisconnectedWaitingPlayers() {
 
 		// Check if room has only user1 waiting and they're disconnected
 		if room.user1.check && !room.user2.check {
-			// Check for nil WebSocket first
 			if room.user1.ws == nil {
 				log.Printf("Removing room with nil WebSocket for waiting player: %s", room.user1.nickname)
 				keepRoom = false
@@ -820,24 +851,16 @@ func cleanupDisconnectedWaitingPlayers() {
 				}
 
 				if !stillInGlobalList {
-					log.Printf("Removing room with WebSocket not in global list for waiting player: %s", room.user1.nickname)
+					log.Printf("Removing room - WebSocket not in global list: %s", room.user1.nickname)
 					room.user1.ws.Close()
 					keepRoom = false
-				} else {
-					// Do a very lightweight connection test using ping control frame
-					room.user1.ws.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
-					err := room.user1.ws.WriteMessage(websocket.PingMessage, []byte{})
-					room.user1.ws.SetWriteDeadline(time.Time{})
-
-					if err != nil {
-						log.Printf("Removing room with unresponsive waiting player: %s (error: %v)", room.user1.nickname, err)
-						// Close the connection and clean up
-						room.user1.ws.Close()
-						removeWebSocketFromSocketsUnsafe(room.user1.ws)
-						connectionsCount--
-						connectionsDecremented++
-						keepRoom = false
-					}
+				} else if !IsWebSocketConnectedSync(room.user1.ws) {
+					log.Printf("Removing room - unresponsive waiting player: %s", room.user1.nickname)
+					removeWebSocketFromSocketsUnsafe(room.user1.ws)
+					room.user1.ws.Close()
+					connectionsCount--
+					connectionsDecremented++
+					keepRoom = false
 				}
 			}
 		}
@@ -857,15 +880,42 @@ func cleanupDisconnectedWaitingPlayers() {
 
 // Background cleanup for disconnected waiting players
 func backgroundCleanup() {
-	ticker := time.NewTicker(30 * time.Second) // Check every 30 seconds
+	ticker := time.NewTicker(15 * time.Second) // Check every 15 seconds for more responsive cleanup
 	defer ticker.Stop()
 
 	for range ticker.C {
 		globalMutex.Lock()
-		initialRoomCount := len(rooms)
-		initialConnectionCount := connectionsCount
 
+		// 1. Synchronize connection count
+		initialConnectionCount := connectionsCount
+		actualSocketCount := len(sockets)
+		if connectionsCount != actualSocketCount {
+			log.Printf("Connection count mismatch: stored=%d, actual=%d. Correcting...",
+				connectionsCount, actualSocketCount)
+			connectionsCount = actualSocketCount
+			BroadcastConnectionsCountUnsafe(connectionsCount)
+		}
+
+		// 2. Clean up disconnected waiting players
+		initialRoomCount := len(rooms)
 		cleanupDisconnectedWaitingPlayers()
+
+		// 3. Clean up dead sockets
+		validSockets := []*websocket.Conn{}
+		for _, socket := range sockets {
+			if socket != nil && IsWebSocketConnectedSync(socket) {
+				validSockets = append(validSockets, socket)
+			} else if socket != nil {
+				socket.Close()
+			}
+		}
+
+		if len(validSockets) != len(sockets) {
+			removedCount := len(sockets) - len(validSockets)
+			sockets = validSockets
+			connectionsCount = len(sockets)
+			log.Printf("Background cleanup: removed %d dead sockets", removedCount)
+		}
 
 		finalRoomCount := len(rooms)
 		finalConnectionCount := connectionsCount
@@ -873,7 +923,9 @@ func backgroundCleanup() {
 		if initialRoomCount != finalRoomCount || initialConnectionCount != finalConnectionCount {
 			log.Printf("Background cleanup: rooms %d->%d, connections %d->%d",
 				initialRoomCount, finalRoomCount, initialConnectionCount, finalConnectionCount)
+			BroadcastConnectionsCountUnsafe(connectionsCount)
 		}
+
 		globalMutex.Unlock()
 	}
 }
