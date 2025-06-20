@@ -91,15 +91,65 @@ var (
 // Handles matching users to rooms or creating new rooms.
 func RoomMatching(ws *websocket.Conn) {
 	log.Printf("Connection attempt from %s. Waiting for nickname.", ws.RemoteAddr())
-	_, nicknameBytes, err := ws.ReadMessage()
-	nickname := string(nicknameBytes)
-	nicknameLength := utf8.RuneCountInString(nickname)
+
+	// 즉시 연결 상태 확인
+	if ws == nil {
+		log.Printf("ERROR: WebSocket is nil for %s", ws.RemoteAddr())
+		return
+	}
+
+	log.Printf("WebSocket connection verified for %s, attempting to read nickname...", ws.RemoteAddr())
+
+	// 닉네임 읽기 시도 시 타임아웃 설정
+	ws.SetReadDeadline(time.Now().Add(30 * time.Second))
+	messageType, nicknameBytes, err := ws.ReadMessage()
+	ws.SetReadDeadline(time.Time{}) // 타임아웃 해제
+
+	log.Printf("ReadMessage result for %s: messageType=%d, bytesLength=%d, error=%v",
+		ws.RemoteAddr(), messageType, len(nicknameBytes), err)
 
 	if err != nil {
 		log.Printf("Error reading nickname from %s: %v", ws.RemoteAddr(), err)
+		// 에러 타입 상세 분석
+		if netErr, ok := err.(net.Error); ok {
+			if netErr.Timeout() {
+				log.Printf("Timeout occurred while waiting for nickname from %s", ws.RemoteAddr())
+			} else {
+				log.Printf("Network error reading nickname from %s: %v", ws.RemoteAddr(), netErr)
+			}
+		} else {
+			log.Printf("Non-network error reading nickname from %s: %v", ws.RemoteAddr(), err)
+		}
 		handleConnectionFailure(ws)
 		return
 	}
+
+	if len(nicknameBytes) == 0 {
+		log.Printf("Empty message received from %s (0 bytes)", ws.RemoteAddr())
+		handleConnectionFailure(ws)
+		return
+	}
+
+	nickname := string(nicknameBytes)
+	log.Printf("Raw nickname received from %s: %q (length: %d bytes)", ws.RemoteAddr(), nickname, len(nicknameBytes))
+
+	// JSON 메시지인지 확인
+	var jsonMsg map[string]interface{}
+	if json.Unmarshal(nicknameBytes, &jsonMsg) == nil {
+		if nick, exists := jsonMsg["nickname"]; exists {
+			if nickStr, ok := nick.(string); ok {
+				nickname = nickStr
+				log.Printf("Extracted nickname from JSON: %s", nickname)
+			}
+		} else {
+			log.Printf("JSON message received but no 'nickname' field found: %v", jsonMsg)
+			handleConnectionFailure(ws)
+			return
+		}
+	}
+
+	nicknameLength := utf8.RuneCountInString(nickname)
+
 	if nicknameLength == 0 {
 		log.Printf("Empty nickname received from %s", ws.RemoteAddr())
 		handleConnectionFailure(ws)
@@ -111,7 +161,7 @@ func RoomMatching(ws *websocket.Conn) {
 		return
 	}
 
-	log.Printf("Nickname received from %s: %s", ws.RemoteAddr(), nickname)
+	log.Printf("Valid nickname received from %s: %s", ws.RemoteAddr(), nickname)
 
 	globalMutex.Lock()
 	defer globalMutex.Unlock()
@@ -156,7 +206,7 @@ func RoomMatching(ws *websocket.Conn) {
 	newRoom.user1.ws = ws
 	newRoom.user1.nickname = nickname
 	rooms = append(rooms, newRoom)
-	log.Printf("User %s (%s) created a new room.", nickname, ws.RemoteAddr())
+	log.Printf("User %s (%s) created a new room and is waiting for opponent.", nickname, ws.RemoteAddr())
 	// User1 will wait in this room; MessageHandler is not started until user2 joins.
 
 	// Increment connection count only after successful room assignment
@@ -164,6 +214,12 @@ func RoomMatching(ws *websocket.Conn) {
 	currentConnections := connectionsCount
 	log.Printf("Connection count incremented for player %s, current total: %d", nickname, currentConnections)
 	BroadcastConnectionsCountUnsafe(currentConnections)
+
+	// 대기 상태 메시지 전송
+	waitingMsg := Message{Message: "Waiting for opponent..."}
+	if err := ws.WriteJSON(waitingMsg); err != nil {
+		log.Printf("Error sending waiting message to %s: %v", ws.RemoteAddr(), err)
+	}
 }
 
 // Main game loop for a room.
@@ -397,6 +453,7 @@ func reading(ws *websocket.Conn) (int, bool, bool) {
 		}
 
 		msgStr := string(msgBytes)
+		log.Printf("Received message from %s: %q", ws.RemoteAddr(), msgStr)
 
 		// Handle ping/pong messages - don't treat them as game moves
 		if msgStr == WebSocketPongType {
@@ -600,24 +657,43 @@ func BroadcastConnectionsCount(count int) {
 
 // Upgrades HTTP connection to WebSocket and adds to global list.
 func upgradeWebSocketConnection(w http.ResponseWriter, r *http.Request) (*websocket.Conn, error) {
+	log.Printf("Attempting WebSocket upgrade for %s", r.RemoteAddr)
+
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("WebSocket upgrade failed for %s: %v", r.RemoteAddr, err) // Corrected: r.RemoteAddr without parentheses
+		log.Printf("WebSocket upgrade failed for %s: %v", r.RemoteAddr, err)
 		return nil, err
 	}
 	log.Printf("WebSocket connection established from %s", ws.RemoteAddr())
 
 	globalMutex.Lock()
 	sockets = append(sockets, ws)
-	log.Printf("Added to sockets list. Total sockets: %d", len(sockets))
+	totalSockets := len(sockets)
 	globalMutex.Unlock()
-	// Note: connectionsCount is incremented by player/spectator specific logic, not here.
+
+	log.Printf("Added to sockets list. Total sockets: %d", totalSockets)
+
+	// 연결 직후 간단한 테스트 메시지 전송
+	testErr := ws.WriteJSON(map[string]interface{}{
+		"type":    "connection_established",
+		"message": "WebSocket connection ready",
+	})
+	if testErr != nil {
+		log.Printf("Failed to send test message to %s: %v", ws.RemoteAddr(), testErr)
+		return ws, nil // 여전히 연결 반환하지만 경고 로그
+	}
+
+	log.Printf("Test message sent successfully to %s", ws.RemoteAddr())
 	return ws, nil
 }
 
 // HTTP handler for game connections.
 func SocketHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Game connection request from %s", r.RemoteAddr)
+
+	// 요청 헤더 로깅
+	log.Printf("Request headers from %s: %v", r.RemoteAddr, r.Header)
+
 	ws, err := upgradeWebSocketConnection(w, r)
 	if err != nil {
 		log.Printf("Failed to upgrade game connection from %s: %v", r.RemoteAddr, err)
@@ -625,11 +701,22 @@ func SocketHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("Starting room matching for %s", ws.RemoteAddr())
-	RoomMatching(ws)
+
+	// RoomMatching을 별도 고루틴에서 실행하여 블로킹 방지
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Panic in RoomMatching for %s: %v", ws.RemoteAddr(), r)
+				handleConnectionFailure(ws)
+			}
+		}()
+		RoomMatching(ws)
+	}()
 }
 
 // HTTP handler for spectator connections.
 func SpectatorHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Spectator connection request from %s", r.RemoteAddr)
 	ws, err := upgradeWebSocketConnection(w, r)
 	if err != nil {
 		return
@@ -730,10 +817,7 @@ func SpectatorHandler(w http.ResponseWriter, r *http.Request) {
 			// Keep-alive or periodic check for client pongs if not relying on ReadMessage
 			// For now, ReadMessage (even if expecting no data) can detect closure.
 			// Or, rely on IsWebSocketConnected check at the start of the loop.
-			// To make it more responsive to client closing, try a non-blocking read or short-timeout read.
-			// The current IsWebSocketConnected sends a ping and expects a pong.
-			// If we don't expect messages from spectator, ReadMessage will block.
-			// The IsWebSocketConnected check at loop start is the main liveness check.
+			// The current IsWebSocketConnected check at loop start is the main liveness check.
 			time.Sleep(2 * time.Second) // Poll for new games or game state changes
 		}
 	}(ws)
