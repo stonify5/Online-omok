@@ -1017,67 +1017,67 @@ func IsWebSocketConnectedSync(conn *websocket.Conn) bool {
 
 func addSocketToSpectators(room *OmokRoom, ws *websocket.Conn) {
 	if room == nil || ws == nil {
-		log.Printf("[SPECTATOR] [MANAGE] action=add_spectator status=invalid_params room_nil=%t ws_nil=%t", 
+		log.Printf("[SPECTATOR] [MANAGE] action=add_spectator status=invalid_params room_nil=%t ws_nil=%t",
 			(room == nil), (ws == nil))
 		return
 	}
-	
+
 	clientAddr := ws.RemoteAddr().String()
 	log.Printf("[SPECTATOR] [MANAGE] action=add_spectator_start client=%s", clientAddr)
-	
+
 	room.spectatorsMux.Lock()
 	defer room.spectatorsMux.Unlock()
-	
+
 	// Check if already exists
 	for i, existingWs := range room.spectators {
 		if existingWs == ws {
-			log.Printf("[SPECTATOR] [MANAGE] action=add_spectator_duplicate client=%s existing_index=%d", 
+			log.Printf("[SPECTATOR] [MANAGE] action=add_spectator_duplicate client=%s existing_index=%d",
 				clientAddr, i)
 			return
 		}
 	}
-	
+
 	room.spectators = append(room.spectators, ws)
 	spectatorCount := len(room.spectators)
-	log.Printf("[SPECTATOR] [MANAGE] action=add_spectator_success client=%s total_spectators=%d", 
+	log.Printf("[SPECTATOR] [MANAGE] action=add_spectator_success client=%s total_spectators=%d",
 		clientAddr, spectatorCount)
 }
 
 func removeSocketFromSpectators(room *OmokRoom, wsToRemove *websocket.Conn) {
 	if room == nil || wsToRemove == nil {
-		log.Printf("[SPECTATOR] [MANAGE] action=remove_spectator status=invalid_params room_nil=%t ws_nil=%t", 
+		log.Printf("[SPECTATOR] [MANAGE] action=remove_spectator status=invalid_params room_nil=%t ws_nil=%t",
 			(room == nil), (wsToRemove == nil))
 		return
 	}
-	
+
 	clientAddr := wsToRemove.RemoteAddr().String()
 	log.Printf("[SPECTATOR] [MANAGE] action=remove_spectator_start client=%s", clientAddr)
-	
+
 	room.spectatorsMux.Lock()
 	defer room.spectatorsMux.Unlock()
 
 	initialCount := len(room.spectators)
 	newSpectators := []*websocket.Conn{}
 	found := false
-	
+
 	for i, ws := range room.spectators {
 		if ws != wsToRemove {
 			newSpectators = append(newSpectators, ws)
 		} else {
 			found = true
-			log.Printf("[SPECTATOR] [MANAGE] action=found_spectator_to_remove client=%s index=%d", 
+			log.Printf("[SPECTATOR] [MANAGE] action=found_spectator_to_remove client=%s index=%d",
 				clientAddr, i)
 		}
 	}
-	
+
 	room.spectators = newSpectators
 	finalCount := len(room.spectators)
-	
+
 	if found {
-		log.Printf("[SPECTATOR] [MANAGE] action=remove_spectator_success client=%s removed=1 before=%d after=%d", 
+		log.Printf("[SPECTATOR] [MANAGE] action=remove_spectator_success client=%s removed=1 before=%d after=%d",
 			clientAddr, initialCount, finalCount)
 	} else {
-		log.Printf("[SPECTATOR] [MANAGE] action=remove_spectator_not_found client=%s spectator_count=%d", 
+		log.Printf("[SPECTATOR] [MANAGE] action=remove_spectator_not_found client=%s spectator_count=%d",
 			clientAddr, finalCount)
 	}
 }
@@ -1087,33 +1087,33 @@ func removeWebSocketFromSocketsUnsafe(wsToRemove *websocket.Conn) {
 		log.Printf("[CONNECTION] [REMOVE] action=remove_socket status=nil_websocket")
 		return
 	}
-	
+
 	clientAddr := wsToRemove.RemoteAddr().String()
 	initialCount := len(sockets)
-	log.Printf("[CONNECTION] [REMOVE] action=remove_socket_start client=%s initial_count=%d", 
+	log.Printf("[CONNECTION] [REMOVE] action=remove_socket_start client=%s initial_count=%d",
 		clientAddr, initialCount)
-	
+
 	newSockets := []*websocket.Conn{}
 	found := false
-	
+
 	for i, ws := range sockets {
 		if ws != wsToRemove {
 			newSockets = append(newSockets, ws)
 		} else {
 			found = true
-			log.Printf("[CONNECTION] [REMOVE] action=found_socket_to_remove client=%s index=%d", 
+			log.Printf("[CONNECTION] [REMOVE] action=found_socket_to_remove client=%s index=%d",
 				clientAddr, i)
 		}
 	}
-	
+
 	sockets = newSockets
 	finalCount := len(sockets)
-	
+
 	if found {
-		log.Printf("[CONNECTION] [REMOVE] action=remove_socket_success client=%s before=%d after=%d", 
+		log.Printf("[CONNECTION] [REMOVE] action=remove_socket_success client=%s before=%d after=%d",
 			clientAddr, initialCount, finalCount)
 	} else {
-		log.Printf("[CONNECTION] [REMOVE] action=remove_socket_not_found client=%s socket_count=%d", 
+		log.Printf("[CONNECTION] [REMOVE] action=remove_socket_not_found client=%s socket_count=%d",
 			clientAddr, finalCount)
 	}
 }
@@ -1121,30 +1121,30 @@ func removeWebSocketFromSocketsUnsafe(wsToRemove *websocket.Conn) {
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	clientAddr := r.RemoteAddr
 	log.Printf("[HEALTH] [CHECK] action=health_check client=%s", clientAddr)
-	
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
-	
+
 	log.Printf("[HEALTH] [CHECK] action=health_response client=%s status=ok", clientAddr)
 }
 
 func cleanupDisconnectedWaitingPlayers() {
 	initialRoomsCount := len(rooms)
 	log.Printf("[CLEANUP] [WAITING_PLAYERS] action=cleanup_start rooms_count=%d", initialRoomsCount)
-	
+
 	newRooms := []*OmokRoom{}
 	connectionsDecremented := 0
 	roomsRemoved := 0
 
 	for roomIndex, room := range rooms {
 		keepRoom := true
-		
-		log.Printf("[CLEANUP] [WAITING_PLAYERS] action=checking_room room_index=%d user1_check=%t user2_check=%t user1_nick=%s", 
+
+		log.Printf("[CLEANUP] [WAITING_PLAYERS] action=checking_room room_index=%d user1_check=%t user2_check=%t user1_nick=%s",
 			roomIndex, room.user1.check, room.user2.check, room.user1.nickname)
 
 		if room.user1.check && !room.user2.check {
 			if room.user1.ws == nil {
-				log.Printf("[CLEANUP] [WAITING_PLAYERS] action=removing_room_nil_ws room_index=%d user1=%s reason=nil_websocket", 
+				log.Printf("[CLEANUP] [WAITING_PLAYERS] action=removing_room_nil_ws room_index=%d user1=%s reason=nil_websocket",
 					roomIndex, room.user1.nickname)
 				keepRoom = false
 				roomsRemoved++
@@ -1158,13 +1158,13 @@ func cleanupDisconnectedWaitingPlayers() {
 				}
 
 				if !stillInGlobalList {
-					log.Printf("[CLEANUP] [WAITING_PLAYERS] action=removing_room_not_in_list room_index=%d user1=%s reason=not_in_global_list", 
+					log.Printf("[CLEANUP] [WAITING_PLAYERS] action=removing_room_not_in_list room_index=%d user1=%s reason=not_in_global_list",
 						roomIndex, room.user1.nickname)
 					room.user1.ws.Close()
 					keepRoom = false
 					roomsRemoved++
 				} else if !IsWebSocketConnectedSync(room.user1.ws) {
-					log.Printf("[CLEANUP] [WAITING_PLAYERS] action=removing_room_unresponsive room_index=%d user1=%s reason=connection_failed", 
+					log.Printf("[CLEANUP] [WAITING_PLAYERS] action=removing_room_unresponsive room_index=%d user1=%s reason=connection_failed",
 						roomIndex, room.user1.nickname)
 					removeWebSocketFromSocketsUnsafe(room.user1.ws)
 					room.user1.ws.Close()
@@ -1173,7 +1173,7 @@ func cleanupDisconnectedWaitingPlayers() {
 					keepRoom = false
 					roomsRemoved++
 				} else {
-					log.Printf("[CLEANUP] [WAITING_PLAYERS] action=keeping_room room_index=%d user1=%s status=responsive", 
+					log.Printf("[CLEANUP] [WAITING_PLAYERS] action=keeping_room room_index=%d user1=%s status=responsive",
 						roomIndex, room.user1.nickname)
 				}
 			}
@@ -1189,7 +1189,7 @@ func cleanupDisconnectedWaitingPlayers() {
 	rooms = newRooms
 	finalRoomsCount := len(rooms)
 
-	log.Printf("[CLEANUP] [WAITING_PLAYERS] action=cleanup_complete rooms_before=%d rooms_after=%d rooms_removed=%d connections_decremented=%d", 
+	log.Printf("[CLEANUP] [WAITING_PLAYERS] action=cleanup_complete rooms_before=%d rooms_after=%d rooms_removed=%d connections_decremented=%d",
 		initialRoomsCount, finalRoomsCount, roomsRemoved, connectionsDecremented)
 
 	if connectionsDecremented > 0 {
@@ -1206,15 +1206,15 @@ func backgroundCleanup() {
 	for range ticker.C {
 		cleanupCycle++
 		log.Printf("[BACKGROUND] [CLEANUP] action=cleanup_cycle_start cycle=%d", cleanupCycle)
-		
+
 		globalMutex.Lock()
 
 		initialConnectionCount := connectionsCount
 		actualSocketCount := len(sockets)
-		
-		log.Printf("[BACKGROUND] [CLEANUP] action=checking_connection_count cycle=%d stored=%d actual=%d", 
+
+		log.Printf("[BACKGROUND] [CLEANUP] action=checking_connection_count cycle=%d stored=%d actual=%d",
 			cleanupCycle, initialConnectionCount, actualSocketCount)
-			
+
 		if connectionsCount != actualSocketCount {
 			log.Printf("[BACKGROUND] [CLEANUP] action=connection_count_mismatch cycle=%d stored=%d actual=%d status=correcting",
 				cleanupCycle, connectionsCount, actualSocketCount)
@@ -1223,21 +1223,21 @@ func backgroundCleanup() {
 		}
 
 		initialRoomCount := len(rooms)
-		log.Printf("[BACKGROUND] [CLEANUP] action=starting_room_cleanup cycle=%d initial_rooms=%d", 
+		log.Printf("[BACKGROUND] [CLEANUP] action=starting_room_cleanup cycle=%d initial_rooms=%d",
 			cleanupCycle, initialRoomCount)
 		cleanupDisconnectedWaitingPlayers()
 
-		log.Printf("[BACKGROUND] [CLEANUP] action=checking_socket_health cycle=%d total_sockets=%d", 
+		log.Printf("[BACKGROUND] [CLEANUP] action=checking_socket_health cycle=%d total_sockets=%d",
 			cleanupCycle, len(sockets))
 		validSockets := []*websocket.Conn{}
 		deadSockets := 0
-		
+
 		for i, socket := range sockets {
 			if socket != nil && IsWebSocketConnectedSync(socket) {
 				validSockets = append(validSockets, socket)
 			} else {
 				deadSockets++
-				log.Printf("[BACKGROUND] [CLEANUP] action=found_dead_socket cycle=%d socket_index=%d socket_nil=%t", 
+				log.Printf("[BACKGROUND] [CLEANUP] action=found_dead_socket cycle=%d socket_index=%d socket_nil=%t",
 					cleanupCycle, i, (socket == nil))
 				if socket != nil {
 					socket.Close()
@@ -1249,7 +1249,7 @@ func backgroundCleanup() {
 			removedCount := len(sockets) - len(validSockets)
 			sockets = validSockets
 			connectionsCount = len(sockets)
-			log.Printf("[BACKGROUND] [CLEANUP] action=removed_dead_sockets cycle=%d removed=%d new_count=%d", 
+			log.Printf("[BACKGROUND] [CLEANUP] action=removed_dead_sockets cycle=%d removed=%d new_count=%d",
 				cleanupCycle, removedCount, connectionsCount)
 		}
 
@@ -1261,7 +1261,7 @@ func backgroundCleanup() {
 				cleanupCycle, initialRoomCount, finalRoomCount, initialConnectionCount, finalConnectionCount)
 			BroadcastConnectionsCountUnsafe(connectionsCount)
 		} else {
-			log.Printf("[BACKGROUND] [CLEANUP] action=no_changes cycle=%d rooms=%d connections=%d", 
+			log.Printf("[BACKGROUND] [CLEANUP] action=no_changes cycle=%d rooms=%d connections=%d",
 				cleanupCycle, finalRoomCount, finalConnectionCount)
 		}
 
@@ -1272,17 +1272,17 @@ func backgroundCleanup() {
 
 func main() {
 	log.Printf("[SERVER] [STARTUP] action=server_init address=%s", serverAddress)
-	
+
 	log.Printf("[SERVER] [STARTUP] action=starting_background_cleanup")
 	go backgroundCleanup()
 
 	log.Printf("[SERVER] [STARTUP] action=registering_handlers")
 	http.HandleFunc("/health", HealthHandler)
 	log.Printf("[SERVER] [STARTUP] action=registered_handler endpoint=/health")
-	
+
 	http.HandleFunc("/game", SocketHandler)
 	log.Printf("[SERVER] [STARTUP] action=registered_handler endpoint=/game")
-	
+
 	http.HandleFunc("/spectator", SpectatorHandler)
 	log.Printf("[SERVER] [STARTUP] action=registered_handler endpoint=/spectator")
 
